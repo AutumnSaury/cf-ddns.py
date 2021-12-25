@@ -3,17 +3,28 @@
 import os
 import re
 import requests
-import json
 
-apikey = ''
-mail_addr = ''
-record_type = ''
+# Your Cloudflare API key
+apikey = 'ffffffffffffffffffffffffffffffff'
+# E-Mail address of your Cloudflare account
+mail_addr = 'username@example.com'
+# TTL of your record, 1 for auto
 ttl = 1
-subdomains = {}
-domain = ''
-zone_id = ''
-net_device = ''
-ipv6_suffix = ''
+# Your domain
+domain = 'example.com'
+# Your subdomains under the domain above
+subdomains = {'examplea', 'exampleb'}
+# Cloudflare Zone ID of your domain
+zone_id = 'ffffffffffffffffffffffffffffffff'
+# Type of your record, A and AAAA supported
+record_type = 'AAAA'
+# The following 2 options will be used only when "record_type" is set to "AAAA"
+# Name of your network card
+net_dev = 'eth0'
+# The last 64 bits of your IPv6 Address, usually determined by the MAC address of your network card
+ipv6_suffix = 'ffff:ffff:ffff:ffff'
+# An HTTP API which returns your public IPv4 address, content type of its response should be plain text, used only when "record_type" is set to "A"
+ipv4_api = 'https://ipv4.icanhazip.com/'
 
 
 def update(apikey: str, mail: str, url: str, zone_id: str, ttl: int, ip_addr: str, record_type: str):
@@ -26,9 +37,12 @@ def update(apikey: str, mail: str, url: str, zone_id: str, ttl: int, ip_addr: st
         'https://api.cloudflare.com/client/v4/zones/' + zone_id + '/dns_records',
         headers=headers,
         params={'name': url}
-    )
-    record_id = record.json()['result'][0]['id']
+    ).json()
+    record_id = record['result'][0]['id']
+    record_content = record['result'][0]['content']
 
+    if record_content == ip_addr:
+        return 600
     status = requests.put(
         'https://api.cloudflare.com/client/v4/zones/' +
         zone_id + '/dns_records/' + record_id,
@@ -40,39 +54,56 @@ def update(apikey: str, mail: str, url: str, zone_id: str, ttl: int, ip_addr: st
             'content': ip_addr,
             'ttl': ttl
         }
-
     )
     return status.status_code
 
 
-result = os.popen('ip -6 addr show dynamic dev ' + net_device).readlines()
-result.pop(0)
-flag = False
-skip = False
-activeIPs = []
-
-for line in result:
-    flag = not flag
-    if flag:
-        activeIPs.append({})
-        address = re.search('(?<=inet6 ).*' + ipv6_suffix +
-                            '(?=\/[0-9]{1,3} )', line)
-        if address:
-            activeIPs[-1]['address'] = address[0]
-        else:
-            skip = True
-            activeIPs.pop(-1)
-            continue
+def get_ip_addr(record_type: str, net_dev: str = 'eth0', api: str = 'https://ipv4.icanhazip.com/', suffix: str = 'ffff:ffff:ffff:ffff'):
+    if record_type == 'AAAA':
+        out = os.popen('ip -6 addr show dynamic dev ' + net_dev)
+        result = out.readlines()
+        result.pop(0)
+        flag = False
+        skip = False
+        active_ips = []
+        for line in result:
+            flag = not flag
+            if flag:
+                address = re.search(
+                    '(?<=inet6 ).*' + suffix + '(?=\/[0-9]{1,3} )',
+                    line
+                )
+                if address:
+                    active_ips.append({'address': address[0]})
+                else:
+                    skip = True
+                    continue
+            else:
+                if skip:
+                    skip = False
+                    continue
+                else:
+                    active_ips[-1]['preferred_lft'] = int(
+                        re.search('(?<=preferred_lft )[0-9]*(?=sec)', line)[0]
+                    )
+        out.close()
+        active_ips.sort(key=lambda ip: ip['preferred_lft'])
+        return active_ips[-1]['address']
+    elif record_type == 'A':
+        return re.search(
+            r'([0-9]{1,3}\.?){4}',
+            requests.get(api).text
+        )[0]
     else:
-        if skip:
-            skip = False
-            continue
-        else:
-            activeIPs[-1]['preferred_lft'] = int(
-                re.search('(?<=preferred_lft )[0-9]*(?=sec)', line)[0]
-            )
+        raise Exception('Unsupported record type')
 
-activeIPs.sort(key=lambda ip: ip['preferred_lft'], reverse=True)
+
+ip_addr = get_ip_addr(
+    record_type=record_type,
+    net_dev=net_dev,
+    api=ipv4_api,
+    suffix=ipv6_suffix
+)
 
 for name in subdomains:
     status = update(
@@ -81,11 +112,22 @@ for name in subdomains:
         name + '.' + domain,
         zone_id,
         ttl,
-        activeIPs[0]['address'],
+        ip_addr,
         record_type
     )
-    if status != 200:
-        print('An error occoured while updating the record of "' +
-              name + '.' + domain + '"')
+    if status == 200:
+        continue
+    elif status == 600:
+        print("IP address wasn't changed, exiting.")
+        exit(0)
+    else:
+        print(
+            'An error occoured while updating the record of "' + name + '.' + domain + '"\n' +
+            'Status code: ' + str(status)
+        )
         exit(1)
-print('All records are now up to date.')
+print(
+    'All records are now up to date.\n' +
+    'New IP address: ' + ip_addr
+)
+exit(0)
